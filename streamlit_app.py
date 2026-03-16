@@ -1,9 +1,8 @@
 import streamlit as st
 import io
 import re
-from copy import copy
-from openpyxl import load_workbook
-from openpyxl.cell.rich_text import CellRichText, TextBlock
+import zipfile
+from lxml import etree
 
 st.set_page_config(page_title="Transcript Cleaner", layout="centered")
 st.title("Transcript Cleaner")
@@ -11,66 +10,120 @@ st.caption("Cleans Source column and trims to TC In / TC Out / Source only.")
 
 uploaded = st.file_uploader("Upload transcript .xlsx", type=["xlsx"])
 
-KEEP_COLS = {"TC In", "TC Out", "Source"}
+NS  = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+TAG = f"{{{NS}}}"
+
+
+def get_si_text(si):
+    runs = si.findall(f"{TAG}r")
+    if runs:
+        return "".join((r.find(f"{TAG}t").text or "") for r in runs if r.find(f"{TAG}t") is not None)
+    t = si.find(f"{TAG}t")
+    return (t.text or "") if t is not None else ""
 
 
 def process_workbook(file_bytes: bytes) -> bytes:
-    wb = load_workbook(io.BytesIO(file_bytes), rich_text=True)
-    ws = wb.active
+    all_files = {}
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+        for name in z.namelist():
+            all_files[name] = z.read(name)
 
-    # --- Map header names to column indices (1-based) ---
-    headers = {cell.value: cell.column for cell in ws[1] if cell.value}
+    if "xl/sharedStrings.xml" not in all_files:
+        raise ValueError("No shared strings found — is this a valid .xlsx transcript file?")
 
-    source_col = headers.get("Source")
-    if source_col is None:
-        raise ValueError("Could not find a 'Source' column in the spreadsheet.")
+    sheet_tree = etree.fromstring(all_files["xl/worksheets/sheet1.xml"])
+    ss_tree    = etree.fromstring(all_files["xl/sharedStrings.xml"])
+    ss_list    = ss_tree.findall(f"{TAG}si")
 
-    # --- Process Source column: strip strikethrough, replace <> with [] ---
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        cell = row[source_col - 1]
-        val = cell.value
+    rows = sheet_tree.findall(f".//{TAG}row")
+    if not rows:
+        raise ValueError("Worksheet appears to be empty.")
 
-        if val is None:
-            continue
+    # --- Detect column letters for TC In, TC Out, Source from header row ---
+    header_map = {}
+    for cell in rows[0].findall(f"{TAG}c"):
+        ref = cell.get("r", "")
+        col_letter = re.match(r"^([A-Z]+)", ref).group(1)
+        v = cell.find(f"{TAG}v")
+        if v is not None and cell.get("t") == "s":
+            header_map[get_si_text(ss_list[int(v.text)])] = col_letter
 
-        # Rich text (list of TextBlock objects)
-        if isinstance(val, CellRichText):
-            cleaned_blocks = []
-            for block in val:
-                if isinstance(block, TextBlock):
-                    # Drop the whole run if strikethrough
-                    if block.font and block.font.strike:
-                        continue
-                    # Replace <...> with [...] in remaining runs
-                    new_text = re.sub(r"<([^>]*)>", r"[\1]", block.text)
-                    new_block = TextBlock(copy(block.font), new_text)
-                    cleaned_blocks.append(new_block)
-                else:
-                    # Plain string segment inside rich text
-                    cleaned_blocks.append(re.sub(r"<([^>]*)>", r"[\1]", str(block)))
-            cell.value = CellRichText(cleaned_blocks) if cleaned_blocks else None
+    needed = {"TC In", "TC Out", "Source"}
+    missing = needed - set(header_map)
+    if missing:
+        raise ValueError(f"Could not find column(s): {', '.join(missing)}")
 
-        # Plain string
-        elif isinstance(val, str):
-            # Check cell-level strikethrough (entire cell is struck)
-            if cell.font and cell.font.strike:
-                cell.value = None
+    source_col = header_map["Source"]
+    keep_cols  = {header_map[n] for n in needed}
+
+    # --- Collect shared string indices used by the Source column ---
+    source_indices = set()
+    for row in rows[1:]:
+        for cell in row.findall(f"{TAG}c"):
+            col = re.match(r"^([A-Z]+)", cell.get("r", "")).group(1)
+            if col == source_col and cell.get("t") == "s":
+                v = cell.find(f"{TAG}v")
+                if v is not None:
+                    source_indices.add(int(v.text))
+
+    # --- Modify shared strings: remove strikethrough runs, replace <> with [] ---
+    for idx in source_indices:
+        si = ss_list[idx]
+        runs = si.findall(f"{TAG}r")
+        if runs:
+            for r in list(runs):
+                rpr = r.find(f"{TAG}rPr")
+                if rpr is not None and rpr.find(f"{TAG}strike") is not None:
+                    si.remove(r)
+                    continue
+                t = r.find(f"{TAG}t")
+                if t is not None and t.text:
+                    t.text = re.sub(r"<([^>]*)>", r"[\1]", t.text)
+        else:
+            t = si.find(f"{TAG}t")
+            if t is not None and t.text:
+                t.text = re.sub(r"<([^>]*)>", r"[\1]", t.text)
+
+    # --- Remove non-keep columns from worksheet rows ---
+    all_cols = set()
+    for row in rows:
+        for cell in row.findall(f"{TAG}c"):
+            col = re.match(r"^([A-Z]+)", cell.get("r", "")).group(1)
+            all_cols.add(col)
+
+    for row in rows:
+        for cell in list(row.findall(f"{TAG}c")):
+            col = re.match(r"^([A-Z]+)", cell.get("r", "")).group(1)
+            if col not in keep_cols:
+                row.remove(cell)
+
+    # --- Renumber column references to A, B, C ---
+    sorted_keep = sorted(keep_cols)
+    col_remap = {old: chr(ord("A") + i) for i, old in enumerate(sorted_keep)}
+
+    for row in rows:
+        for cell in row.findall(f"{TAG}c"):
+            old_ref = cell.get("r", "")
+            col = re.match(r"^([A-Z]+)", old_ref).group(1)
+            row_num = re.search(r"(\d+)$", old_ref).group(1)
+            cell.set("r", f"{col_remap.get(col, col)}{row_num}")
+
+    # --- Serialize and repack ---
+    new_sheet_xml = etree.tostring(sheet_tree, xml_declaration=True, encoding="UTF-8", standalone=True)
+    new_ss_xml    = etree.tostring(ss_tree,    xml_declaration=True, encoding="UTF-8", standalone=True)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name, data in all_files.items():
+            if name == "xl/worksheets/sheet1.xml":
+                zout.writestr(name, new_sheet_xml)
+            elif name == "xl/sharedStrings.xml":
+                zout.writestr(name, new_ss_xml)
             else:
-                cell.value = re.sub(r"<([^>]*)>", r"[\1]", val)
+                zout.writestr(name, data)
 
-    # --- Delete columns that aren't TC In / TC Out / Source ---
-    # Collect column indices to delete (high → low to avoid shifting issues)
-    cols_to_delete = sorted(
-        [col for name, col in headers.items() if name not in KEEP_COLS],
-        reverse=True,
-    )
-    for col_idx in cols_to_delete:
-        ws.delete_cols(col_idx)
-
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
-    return out.read()
+    buf.seek(0)
+    return buf.read()
 
 
 if uploaded:
