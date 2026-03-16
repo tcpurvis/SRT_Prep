@@ -5,8 +5,8 @@ import zipfile
 from lxml import etree
 from copy import deepcopy
 
-st.set_page_config(page_title="Transcript Cleaner", layout="centered")
-st.title("Transcript Cleaner")
+st.set_page_config(page_title="Transcript to Subtitle Prep", layout="centered")
+st.title("Transcript to Subtitle Prep")
 st.caption("Cleans Source column and trims to TC In / TC Out / Source only.")
 
 uploaded = st.file_uploader("Upload transcript .xlsx", type=["xlsx"])
@@ -97,7 +97,54 @@ def process_workbook(file_bytes: bytes):
         raise ValueError(f"Could not find column(s): {', '.join(missing)}")
 
     source_col = header_map["Source"]
+    tc_cols    = {header_map["TC In"], header_map["TC Out"]}
     keep_cols  = {header_map[n] for n in needed}
+
+    # Load styles for font-level strike detection
+    styles_tree = etree.fromstring(all_files["xl/styles.xml"])
+    xfs_list    = list(styles_tree.find(f"{TAG}cellXfs"))
+    fonts_list  = list(styles_tree.find(f"{TAG}fonts"))
+
+    def font_has_strike(cell):
+        font_id = int(xfs_list[int(cell.get("s", 0))].get("fontId", 0))
+        return fonts_list[font_id].find(f"{TAG}strike") is not None
+
+    def si_fully_struck(si):
+        """True only if every run in a rich-text shared string is strikethrough."""
+        runs = si.findall(f"{TAG}r")
+        if not runs:
+            return False
+        return all(
+            r.find(f"{TAG}rPr") is not None
+            and r.find(f"{TAG}rPr").find(f"{TAG}strike") is not None
+            for r in runs
+        )
+
+    def cell_is_struck(cell):
+        """True if the cell's content is entirely struck through."""
+        if font_has_strike(cell):
+            return True
+        v = cell.find(f"{TAG}v")
+        if v is not None and cell.get("t") == "s":
+            return si_fully_struck(ss_list[int(v.text)])
+        return False
+
+    # --- Delete rows where TC In, TC Out, AND Source are all struck through ---
+    sheet_data = sheet_tree.find(f"{TAG}sheetData")
+    for row in rows[1:]:
+        cells = {
+            re.match(r"^([A-Z]+)", c.get("r", "")).group(1): c
+            for c in row.findall(f"{TAG}c")
+        }
+        check_cols = tc_cols | {source_col}
+        if all(
+            col in cells and cell_is_struck(cells[col])
+            for col in check_cols
+        ):
+            sheet_data.remove(row)
+
+    # Refresh rows list after deletions
+    rows = sheet_tree.findall(f".//{TAG}row")
 
     # Map shared string index -> row numbers that reference it (Source col only)
     source_idx_to_rows = {}
@@ -167,12 +214,16 @@ def process_workbook(file_bytes: bytes):
                 ss_idx = int(v.text) if v is not None and cell.get("t") == "s" else None
                 cell.set("s", str(xf_wrap_yellow if ss_idx in modified_ss_indices else xf_wrap))
 
+    # Disable fixed row height so Excel auto-fits wrapped text
+    sfp = sheet_tree.find(f"{TAG}sheetFormatPr")
+    if sfp is not None:
+        sfp.set("customHeight", "0")
+
     # Rebuild <cols> with correct widths for new A/B/C layout
     cols_el = sheet_tree.find(f"{TAG}cols")
     if cols_el is not None:
         cols_el.getparent().remove(cols_el)
 
-    sheet_data = sheet_tree.find(f"{TAG}sheetData")
     cols_new = etree.Element(f"{TAG}cols")
     tc_col = etree.SubElement(cols_new, f"{TAG}col")
     tc_col.set("min", "1"); tc_col.set("max", "2")
