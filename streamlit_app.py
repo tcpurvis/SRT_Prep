@@ -66,7 +66,7 @@ def add_styles(styles_xml: bytes):
     )
 
 
-def process_workbook(file_bytes: bytes):
+def process_workbook(file_bytes: bytes, keep_character: bool = False):
     all_files = {}
     with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
         for name in z.namelist():
@@ -92,6 +92,8 @@ def process_workbook(file_bytes: bytes):
             header_map[get_si_text(ss_list[int(v.text)])] = col_letter
 
     needed = {"TC In", "TC Out", "Source"}
+    if keep_character:
+        needed.add("Character")
     missing = needed - set(header_map)
     if missing:
         raise ValueError(f"Could not find column(s): {', '.join(missing)}")
@@ -253,13 +255,31 @@ def process_workbook(file_bytes: bytes):
 if uploaded:
     raw = uploaded.read()
     try:
-        result, n_changed = process_workbook(raw)
-        st.success(f"Done — {n_changed} rows revised and highlighted.")
-        st.download_button(
-            label="⬇️ Download cleaned file",
-            data=result,
-            file_name=f"cleaned_{uploaded.name}",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("Subtitle Prep")
+            result, n_changed = process_workbook(raw, keep_character=False)
+            st.caption(f"{n_changed} rows revised and highlighted.")
+            st.download_button(
+                label="⬇️ Download",
+                data=result,
+                file_name=f"subtitle_prep_{uploaded.name}",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_subtitle",
+            )
+
+        with col2:
+            st.subheader("Animated Sub Prep")
+            result_anim, n_changed_anim = process_workbook(raw, keep_character=True)
+            st.caption(f"{n_changed_anim} rows revised and highlighted.")
+            st.download_button(
+                label="⬇️ Download",
+                data=result_anim,
+                file_name=f"animated_sub_prep_{uploaded.name}",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_animated",
+            )
+
     except Exception as e:
         st.error(f"Something went wrong: {e}")
