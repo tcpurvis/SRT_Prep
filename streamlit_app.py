@@ -91,6 +91,10 @@ def process_workbook(file_bytes: bytes, keep_character: bool = False):
         if v is not None and cell.get("t") == "s":
             header_map[get_si_text(ss_list[int(v.text)])] = col_letter
 
+    # Normalize "Text" column header to "Source" so both are supported
+    if "Text" in header_map and "Source" not in header_map:
+        header_map["Source"] = header_map["Text"]
+
     needed = {"TC In", "TC Out", "Source"}
     if keep_character:
         needed.add("Character")
